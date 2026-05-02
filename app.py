@@ -21,7 +21,7 @@ load_dotenv()
 # CONFIG
 # ─────────────────────────────────────────
 st.set_page_config(
-    page_title="Demand Prediction",
+    page_title="Demand Oracle",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -350,9 +350,9 @@ def load_resnet():
         # Not found locally — download via torchvision (uses torch hub cache)
         # Cache location: ~/.cache/torch/hub/checkpoints/
         # Downloaded once, reused on every subsequent run
-        cache_path = os.path.join(
-            torch.hub.get_dir(), "checkpoints", "resnet50-11ad3fa6.pth"
-        )
+        cache_dir  = os.path.join(torch.hub.get_dir(), "checkpoints")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, "resnet50-11ad3fa6.pth")
         if not os.path.exists(cache_path):
             with st.spinner("⬇️ Downloading ResNet50 weights (~100 MB, once only)…"):
                 torch.hub.download_url_to_file(
@@ -494,7 +494,7 @@ def call_openrouter(prompt: str, image: Image.Image) -> str | None:
         "Authorization": f"Bearer {OPENROUTER_KEY}",
         "Content-Type" : "application/json",
         "HTTP-Referer" : "https://maalde.app",
-        "X-Title"      : "Maalde Demand Prediction",
+        "X-Title"      : "Maalde Demand Oracle",
     }
     payload = {
         "model": OPENROUTER_MODEL,
@@ -766,7 +766,7 @@ def main():
     st.markdown("""
     <div>
         <p class="hero-sub">Fashion Intelligence · AI-Powered</p>
-        <h1 class="hero-title">Demand <span>Prediction</span></h1>
+        <h1 class="hero-title">Demand <span>Oracle</span></h1>
         <div class="hero-line"></div>
     </div>
     """, unsafe_allow_html=True)
