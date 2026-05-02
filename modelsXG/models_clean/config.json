@@ -1,1 +1,0 @@
-{"cat_cols": ["fabric", "length", "sleeves", "neck", "work", "pattern", "occasion"], "bool_cols": ["dupatta", "pants_included"], "num_cols": ["rate_avg"], "target": "qty_total"}

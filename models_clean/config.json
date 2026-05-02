@@ -1,0 +1,1 @@
+{"cat_cols": ["fabric", "length", "sleeves", "neck", "work", "pattern", "primary_color", "occasion", "price_tier"], "bool_cols": ["dupatta", "pants_included"], "num_cols": ["rate_avg", "days_on_market", "colorfulness_y", "brightness_mean_y", "contrast_y", "edge_density_y", "texture_complexity_y", "color_variety_y"]}

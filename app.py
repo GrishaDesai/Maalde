@@ -4,777 +4,768 @@ import numpy as np
 import joblib
 import json
 import os
-import io
-import base64
-import requests
-import colorsys
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
 from PIL import Image, ImageFilter
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')
-from dotenv import load_dotenv
+from sklearn.metrics.pairwise import cosine_similarity
 
-# ── Load .env ─────────────────────────────────────────────────────
-load_dotenv()
-
-# ── Page config ───────────────────────────────────────────────────
+# ─────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────
 st.set_page_config(
-    page_title="Maalde — Demand Prediction Engine",
-    page_icon="👗",
-    layout="wide"
+    page_title="Demand Oracle",
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
-# ── Absolute paths ────────────────────────────────────────────────
-BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR     = os.path.join(BASE_DIR, "data")
-MODEL_DIR    = os.path.join(BASE_DIR, "modelsXG")
-WEIGHTS_PATH = os.path.join(DATA_DIR, "resnet50-11ad3fa6.pth")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, "models_clean")
+DATA_DIR  = os.path.join(BASE_DIR, "data")
 
-# ── Load API keys from .env ───────────────────────────────────────
-def _load_keys(prefix):
-    """Load all keys matching prefix_1, prefix_2... from env."""
-    keys = []
-    for i in range(1, 10):
-        k = os.getenv(f"{prefix}_{i}", "").strip()
-        if k and not k.startswith("your_"):
-            keys.append(k)
-    return keys
+# ── Google Drive config ───────────────────────────────────────────────────────
+DRIVE_FOLDER_ID = "1tvA0sBjuQejPzkVJ0JNj8eBK9mTo34jb"
 
-GEMINI_KEYS       = _load_keys("GEMINI_KEY")
-OPENROUTER_KEYS   = _load_keys("OPENROUTER_KEY")
-PREFERRED_PROVIDER= os.getenv("PREFERRED_PROVIDER", "gemini").lower()
-OPENROUTER_MODEL  = os.getenv("OPENROUTER_MODEL", "openrouter/free")
-GEMINI_MODEL      = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+# ── Auto-build product_code → file_id map from public Drive folder ────────────
+GOOGLE_API_KEY = "AIzaSyA3C5gEzh38AJ4zNgjFqvH22FKCFMKmy4g"  
 
-OPENROUTER_URL    = "https://openrouter.ai/api/v1/chat/completions"
-GEMINI_BASE_URL   = "https://generativelanguage.googleapis.com/v1beta/models"
-
-# ── Key rotation state (session-level) ───────────────────────────
-def _init_key_state():
-    if "gemini_key_idx"     not in st.session_state:
-        st.session_state.gemini_key_idx     = 0
-    if "openrouter_key_idx" not in st.session_state:
-        st.session_state.openrouter_key_idx = 0
-    if "provider"           not in st.session_state:
-        st.session_state.provider           = PREFERRED_PROVIDER
-    if "api_log"            not in st.session_state:
-        st.session_state.api_log            = []
-
-def _log(msg):
-    st.session_state.api_log.append(msg)
-
-def _next_gemini_key():
-    keys = GEMINI_KEYS
-    if not keys:
-        return None
-    idx = st.session_state.gemini_key_idx % len(keys)
-    st.session_state.gemini_key_idx = (idx + 1) % len(keys)
-    return keys[idx]
-
-def _next_openrouter_key():
-    keys = OPENROUTER_KEYS
-    if not keys:
-        return None
-    idx = st.session_state.openrouter_key_idx % len(keys)
-    st.session_state.openrouter_key_idx = (idx + 1) % len(keys)
-    return keys[idx]
-
-# ── Gemini API call ───────────────────────────────────────────────
-def _call_gemini_single(key, prompt, image):
-    """Single Gemini API call. Returns text or raises exception."""
-    url = f"{GEMINI_BASE_URL}/{GEMINI_MODEL}:generateContent?key={key}"
-    buf = io.BytesIO()
-    image.save(buf, format='JPEG', quality=85)
-    b64 = base64.b64encode(buf.getvalue()).decode()
-
-    payload = {
-        "contents": [{"parts": [
-            {"text": prompt},
-            {"inline_data": {"mime_type": "image/jpeg", "data": b64}}
-        ]}],
-        "generationConfig": {"temperature": 0}
-    }
-    r      = requests.post(url, json=payload, timeout=60)
-    result = r.json()
-
-    if "candidates" in result:
-        return result["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-    error  = result.get("error", {})
-    code   = error.get("code", 0)
-    msg    = error.get("message", str(result))
-
-    if code in (429, 403) or "quota" in msg.lower():
-        raise QuotaExhaustedException(f"Gemini quota: {msg}")
-    raise Exception(f"Gemini error {code}: {msg}")
-
-
-# ── OpenRouter API call ───────────────────────────────────────────
-def _call_openrouter_single(key, prompt, image):
-    """Single OpenRouter API call. Returns text or raises exception."""
-    buf = io.BytesIO()
-    image.save(buf, format='JPEG', quality=85)
-    b64 = base64.b64encode(buf.getvalue()).decode()
-
-    payload = {
-        "model"   : OPENROUTER_MODEL,
-        "messages": [{"role": "user", "content": [
-            {"type": "text",      "text": prompt},
-            {"type": "image_url", "image_url": {
-                "url": f"data:image/jpeg;base64,{b64}"
-            }}
-        ]}],
-        "temperature": 0,
-        "max_tokens" : 1000,
-    }
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type" : "application/json",
-        "HTTP-Referer" : "https://maalde.com",
-        "X-Title"      : "Maalde Demand Prediction",
-    }
-    r      = requests.post(OPENROUTER_URL, json=payload,
-                           headers=headers, timeout=60)
-    result = r.json()
-
-    if "choices" in result:
-        return result["choices"][0]["message"]["content"].strip()
-
-    error = result.get("error", {})
-    code  = error.get("code", 0)
-    msg   = error.get("message", str(result))
-
-    if code in (429, 402) or "quota" in msg.lower() or "credit" in msg.lower():
-        raise QuotaExhaustedException(f"OpenRouter quota: {msg}")
-    raise Exception(f"OpenRouter error {code}: {msg}")
-
-
-class QuotaExhaustedException(Exception):
-    pass
-
-
-# ── Smart API caller with auto key + provider rotation ────────────
-def call_vision_api(prompt, image):
+@st.cache_resource(show_spinner=False)
+def build_image_map_from_drive(folder_id: str, api_key: str) -> dict:
     """
-    Tries keys in this order:
-    1. All keys of preferred provider
-    2. All keys of fallback provider
-    3. Returns None if all exhausted
+    Fetches all filenames + IDs from a public Drive folder.
+    Files must be named like  KA001.jpeg / KA001.jpg / KA001.png
+    Returns dict: {"KA001": "<file_id>", ...}
     """
-    _init_key_state()
+    if not api_key:
+        return {}
 
-    providers_order = (
-        ["gemini", "openrouter"]
-        if st.session_state.provider == "gemini"
-        else ["openrouter", "gemini"]
-    )
+    import urllib.request, urllib.parse
 
-    for provider in providers_order:
-        if provider == "gemini":
-            keys     = GEMINI_KEYS
-            call_fn  = _call_gemini_single
-            label    = "Gemini"
-        else:
-            keys     = OPENROUTER_KEYS
-            call_fn  = _call_openrouter_single
-            label    = "OpenRouter"
+    image_map = {}
+    page_token = None
 
-        if not keys:
-            _log(f"⚠️ No {label} keys configured — skipping")
-            continue
+    while True:
+        params = {
+            "q": f"'{folder_id}' in parents and trashed=false",
+            "fields": "nextPageToken,files(id,name)",
+            "pageSize": "1000",
+            "key": api_key,
+        }
+        if page_token:
+            params["pageToken"] = page_token
 
-        # Try each key of this provider
-        for attempt in range(len(keys)):
-            key = _next_gemini_key() if provider == "gemini" else _next_openrouter_key()
-            try:
-                result = call_fn(key, prompt, image)
-                _log(f"✅ {label} key ***{key[-6:]} succeeded")
-                st.session_state.provider = provider  # remember what worked
-                return result
+        url = "https://www.googleapis.com/drive/v3/files?" + urllib.parse.urlencode(params)
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as e:
+            st.warning(f"Drive API error: {e}")
+            break
 
-            except QuotaExhaustedException as e:
-                _log(f"⚠️ {label} key ***{key[-6:]} quota exhausted → rotating")
-                continue
+        for f in data.get("files", []):
+            name = f["name"]
+            # Strip extension → product code
+            code = os.path.splitext(name)[0]
+            image_map[code] = f["id"]
 
-            except Exception as e:
-                _log(f"❌ {label} key ***{key[-6:]} error: {str(e)[:80]}")
-                continue
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
 
-        _log(f"❌ All {label} keys exhausted → switching provider")
+    return image_map
 
-    _log("❌ All providers and keys exhausted")
+PRODUCT_IMAGE_MAP: dict = {}   # populated after page load (see main())
+
+# ─────────────────────────────────────────
+# PREMIUM CSS
+# ─────────────────────────────────────────
+PREMIUM_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300&family=DM+Sans:wght@300;400;500&display=swap');
+
+/* ── Root palette ── */
+:root {
+    --bg:       #0c0c0f;
+    --surface:  #131318;
+    --surface2: #1a1a22;
+    --border:   rgba(255,255,255,0.07);
+    --accent:   #e8b86d;
+    --accent2:  #c47f3a;
+    --text:     #e8e4dc;
+    --muted:    #7a7880;
+    --success:  #6fcf8e;
+    --radius:   14px;
+}
+
+/* ── Global reset ── */
+html, body, [class*="css"] {
+    font-family: 'DM Sans', sans-serif;
+    background-color: var(--bg) !important;
+    color: var(--text) !important;
+}
+
+/* ── Hide default Streamlit chrome ── */
+#MainMenu, footer, header { visibility: hidden; }
+.block-container { padding: 2rem 3rem 4rem !important; max-width: 1400px; }
+
+/* ── Animated grain overlay ── */
+body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+    pointer-events: none;
+    z-index: 9999;
+    opacity: 0.6;
+}
+
+/* ── Hero header ── */
+.hero-title {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: clamp(2.8rem, 5vw, 4.5rem);
+    font-weight: 300;
+    letter-spacing: -0.02em;
+    line-height: 1.05;
+    color: var(--text);
+    margin: 0;
+}
+.hero-title span { color: var(--accent); font-style: italic; }
+.hero-sub {
+    font-size: 0.82rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-top: 0.4rem;
+}
+.hero-line {
+    height: 1px;
+    background: linear-gradient(90deg, var(--accent) 0%, transparent 70%);
+    margin: 1.5rem 0 2rem;
+}
+
+/* ── Upload zone ── */
+[data-testid="stFileUploader"] {
+    background: var(--surface) !important;
+    border: 1.5px dashed var(--accent2) !important;
+    border-radius: var(--radius) !important;
+    padding: 2rem !important;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+[data-testid="stFileUploader"]:hover {
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 30px rgba(232,184,109,0.08) !important;
+}
+[data-testid="stFileUploader"] label { color: var(--muted) !important; }
+
+/* ── Image preview card ── */
+.img-card {
+    background: var(--surface);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+}
+.img-card img { width: 100%; display: block; }
+.img-card-label {
+    padding: 0.8rem 1rem;
+    font-size: 0.72rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-top: 1px solid var(--border);
+}
+
+/* ── Predict button ── */
+.stButton > button {
+    width: 100%;
+    background: linear-gradient(135deg, var(--accent2), var(--accent)) !important;
+    color: #1a0e00 !important;
+    font-family: 'DM Sans', sans-serif !important;
+    font-weight: 500 !important;
+    font-size: 0.85rem !important;
+    letter-spacing: 0.12em !important;
+    text-transform: uppercase !important;
+    border: none !important;
+    border-radius: 8px !important;
+    padding: 0.85rem 2rem !important;
+    cursor: pointer !important;
+    transition: opacity 0.2s, transform 0.15s !important;
+    box-shadow: 0 4px 20px rgba(196,127,58,0.3) !important;
+}
+.stButton > button:hover {
+    opacity: 0.9 !important;
+    transform: translateY(-1px) !important;
+    box-shadow: 0 8px 30px rgba(196,127,58,0.4) !important;
+}
+
+/* ── Metric cards ── */
+.metric-row { display: flex; gap: 1rem; margin: 1.5rem 0; }
+.metric-card {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.2rem 1.4rem;
+    position: relative;
+    overflow: hidden;
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+.metric-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+}
+.metric-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: var(--accent);
+    opacity: 0.6;
+}
+.metric-card.highlight::before { background: linear-gradient(90deg, var(--accent2), var(--accent)); opacity: 1; }
+.metric-label {
+    font-size: 0.68rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 0.4rem;
+}
+.metric-value {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 2.4rem;
+    font-weight: 300;
+    color: var(--text);
+    line-height: 1;
+}
+.metric-card.highlight .metric-value { color: var(--accent); }
+.metric-unit { font-size: 0.75rem; color: var(--muted); margin-top: 0.2rem; }
+
+/* ── Section heading ── */
+.section-head {
+    font-size: 0.7rem;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 2.5rem 0 1rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+.section-head::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+}
+
+/* ── Tag chips ── */
+.tag-chip {
+    display: inline-block;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 100px;
+    padding: 0.25rem 0.8rem;
+    font-size: 0.72rem;
+    color: var(--muted);
+    margin: 0.2rem;
+}
+.tag-chip.warm {
+    border-color: rgba(232,184,109,0.3);
+    color: var(--accent);
+    background: rgba(232,184,109,0.06);
+}
+
+/* ── Similar product cards ── */
+.sim-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; margin-top: 1rem; }
+.sim-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: transform 0.2s, box-shadow 0.2s;
+    cursor: default;
+}
+.sim-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 16px 50px rgba(0,0,0,0.5);
+    border-color: rgba(232,184,109,0.2);
+}
+.sim-card img {
+    width: 100%;
+    aspect-ratio: 3/4;
+    object-fit: cover;
+    display: block;
+    background: var(--surface2);
+}
+.sim-card-img-placeholder {
+    width: 100%;
+    aspect-ratio: 3/4;
+    background: linear-gradient(135deg, var(--surface2), var(--surface));
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 2.5rem;
+    opacity: 0.4;
+}
+.sim-card-body { padding: 0.8rem 0.9rem; }
+.sim-card-name {
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 0.3rem;
+}
+.sim-card-code { font-size: 0.65rem; color: var(--muted); letter-spacing: 0.08em; }
+.sim-card-meta { display: flex; justify-content: space-between; align-items: center; margin-top: 0.5rem; }
+.sim-card-price {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 1.15rem;
+    color: var(--accent);
+}
+.sim-score {
+    font-size: 0.65rem;
+    background: rgba(232,184,109,0.1);
+    border: 1px solid rgba(232,184,109,0.2);
+    color: var(--accent);
+    border-radius: 100px;
+    padding: 0.15rem 0.5rem;
+}
+.sim-card-tags { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.5rem; }
+.sim-mini-tag {
+    font-size: 0.6rem;
+    background: var(--surface2);
+    border-radius: 4px;
+    padding: 0.1rem 0.4rem;
+    color: var(--muted);
+}
+
+/* ── Warning box ── */
+.warn-box {
+    background: rgba(232,184,109,0.05);
+    border: 1px solid rgba(232,184,109,0.2);
+    border-radius: 8px;
+    padding: 0.8rem 1rem;
+    margin-top: 1rem;
+}
+.warn-box-title { font-size: 0.68rem; letter-spacing: 0.15em; text-transform: uppercase; color: var(--accent2); margin-bottom: 0.4rem; }
+.warn-item { font-size: 0.75rem; color: var(--muted); padding: 0.15rem 0; }
+
+/* ── Divider ── */
+.divider { height: 1px; background: var(--border); margin: 2rem 0; }
+
+/* ── Spinner overrides ── */
+[data-testid="stSpinner"] > div { border-top-color: var(--accent) !important; }
+</style>
+"""
+
+
+# ─────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def fetch_drive_image_b64(file_id: str, api_key: str) -> str | None:
+    """
+    Download image from Drive server-side using API key and return as base64.
+    This bypasses the browser auth issue with thumbnail URLs.
+    Cached so each file is only downloaded once per session.
+    """
+    import urllib.request
+    # Use Drive API to download the file content directly
+    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&key={api_key}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read()
+        import base64
+        return "data:image/jpeg;base64," + base64.b64encode(raw).decode()
+    except Exception:
+        return None
+
+
+def get_product_image_b64(product_code: str) -> str | None:
+    """Return base64 image string for a product code, or None if not found."""
+    code = str(product_code).strip()
+    fid  = PRODUCT_IMAGE_MAP.get(code)
+    if fid and GOOGLE_API_KEY:
+        return fetch_drive_image_b64(fid, GOOGLE_API_KEY)
     return None
 
 
-# ── Model loading ─────────────────────────────────────────────────
+# ─────────────────────────────────────────
+# LOAD ARTIFACTS
+# ─────────────────────────────────────────
 @st.cache_resource
-def load_model_artifacts():
-    required = {
-        "demand_model.pkl"   : os.path.join(MODEL_DIR, "demand_model.pkl"),
-        "ohe_encoder.pkl"    : os.path.join(MODEL_DIR, "ohe_encoder.pkl"),
-        "pca.pkl"            : os.path.join(MODEL_DIR, "pca.pkl"),
-        "feature_config.json": os.path.join(MODEL_DIR, "feature_config.json"),
-        "training_data.csv"  : os.path.join(MODEL_DIR, "training_data.csv"),
-    }
-    missing = [k for k, v in required.items() if not os.path.exists(v)]
-    if missing:
-        raise FileNotFoundError(f"Missing files in modelsXG/: {', '.join(missing)}")
-
-    model    = joblib.load(required["demand_model.pkl"])
-    ohe      = joblib.load(required["ohe_encoder.pkl"])
-    pca      = joblib.load(required["pca.pkl"])
-    with open(required["feature_config.json"]) as f:
-        config = json.load(f)
-    train_df = pd.read_csv(required["training_data.csv"])
-    return model, ohe, pca, config, train_df
+def load_artifacts():
+    model       = joblib.load(os.path.join(MODEL_DIR, "model.pkl"))
+    ohe         = joblib.load(os.path.join(MODEL_DIR, "ohe.pkl"))
+    scaler      = joblib.load(os.path.join(MODEL_DIR, "scaler.pkl"))
+    with open(os.path.join(MODEL_DIR, "config.json")) as f:
+        config  = json.load(f)
+    train_df    = pd.read_csv("final_dataset_training.csv")
+    resnet_train = joblib.load(os.path.join(MODEL_DIR, "resnet_features.pkl"))
+    return model, ohe, scaler, config, train_df, resnet_train
 
 
+# ─────────────────────────────────────────
+# LOAD RESNET
+# ─────────────────────────────────────────
 @st.cache_resource
 def load_resnet():
-    device = torch.device('cpu')
-    if os.path.exists(WEIGHTS_PATH):
-        resnet = models.resnet50(weights=None)
-        resnet.load_state_dict(torch.load(WEIGHTS_PATH, map_location=device))
-    else:
-        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
-    extractor  = nn.Sequential(*list(resnet.children())[:-1])
+    device      = torch.device("cpu")
+    weights_path = os.path.join(DATA_DIR, "resnet50-11ad3fa6.pth")
+    resnet      = models.resnet50(weights=None)
+    resnet.load_state_dict(torch.load(weights_path, map_location=device))
+    extractor   = nn.Sequential(*list(resnet.children())[:-1])
     extractor.eval()
-    preprocess = transforms.Compose([
+    preprocess  = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std =[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
     ])
     return extractor, preprocess, device
 
 
-# ── Feature extraction ────────────────────────────────────────────
+# ─────────────────────────────────────────
+# FEATURE EXTRACTION
+# ─────────────────────────────────────────
+def extract_resnet_features(img, extractor, preprocess, device):
+    tensor = preprocess(img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        feat = extractor(tensor).squeeze()
+    return feat.cpu().numpy()
+
+
 def get_color_features(img):
     feats     = {}
     img_small = img.resize((100, 100))
     pixels    = np.array(img_small).reshape(-1, 3).astype(float)
 
-    feats['r_mean'] = pixels[:,0].mean() / 255.0
-    feats['g_mean'] = pixels[:,1].mean() / 255.0
-    feats['b_mean'] = pixels[:,2].mean() / 255.0
-    feats['r_std']  = pixels[:,0].std()  / 255.0
-    feats['g_std']  = pixels[:,1].std()  / 255.0
-    feats['b_std']  = pixels[:,2].std()  / 255.0
-
     brightness = (0.299*pixels[:,0] + 0.587*pixels[:,1] + 0.114*pixels[:,2]) / 255.0
-    feats['brightness_mean'] = float(brightness.mean())
-    feats['brightness_std']  = float(brightness.std())
+    feats['brightness_mean_y'] = float(brightness.mean())
 
     gray = np.array(img_small.convert('L')).astype(float) / 255.0
-    feats['contrast'] = float(gray.std())
+    feats['contrast_y'] = float(gray.std())
 
-    rg = pixels[:,0] - pixels[:,1]
-    yb = 0.5*(pixels[:,0]+pixels[:,1]) - pixels[:,2]
-    feats['colorfulness'] = float(
-        np.sqrt(rg.std()**2 + yb.std()**2) + 0.3*np.sqrt(rg.mean()**2 + yb.mean()**2)
-    ) / 255.0
-
-    feats['warm_cool_bias'] = feats['r_mean'] - feats['b_mean']
-
-    sample = pixels[:500].astype(int)
-    hsv    = np.array([colorsys.rgb_to_hsv(r/255, g/255, b/255) for r,g,b in sample])
-    feats['hue_mean']        = float(hsv[:,0].mean())
-    feats['hue_std']         = float(hsv[:,0].std())
-    feats['saturation_mean'] = float(hsv[:,1].mean())
-    feats['saturation_std']  = float(hsv[:,1].std())
-    feats['value_mean']      = float(hsv[:,2].mean())
+    rg  = pixels[:,0] - pixels[:,1]
+    yb  = 0.5*(pixels[:,0]+pixels[:,1]) - pixels[:,2]
+    feats['colorfulness_y'] = float(np.sqrt(rg.std()**2 + yb.std()**2)) / 255.0
 
     gray_img = img.resize((128,128)).convert('L')
     edges    = gray_img.filter(ImageFilter.FIND_EDGES)
     edge_arr = np.array(edges).astype(float)
-    feats['edge_density']       = float(edge_arr.mean() / 255.0)
-    feats['edge_variance']      = float(edge_arr.var() / (255.0**2))
-    feats['texture_complexity'] = float(np.array(gray_img).std() / 255.0)
 
-    arr         = np.array(gray_img).astype(float)
-    block_vars  = [arr[r:r+32, c:c+32].var()
-                   for r in range(0,128,32) for c in range(0,128,32)]
-    feats['local_contrast_mean'] = float(np.mean(block_vars) / (255.0**2))
-    feats['local_contrast_std']  = float(np.std(block_vars)  / (255.0**2))
-    feats['color_variety']       = min(feats['edge_density'] * 10, 1.0)
+    feats['edge_density_y']       = float(edge_arr.mean() / 255.0)
+    feats['texture_complexity_y'] = float(np.array(gray_img).std() / 255.0)
+    feats['color_variety_y']      = min(feats['edge_density_y'] * 10, 1.0)
     return feats
 
 
-def extract_resnet_features(img, extractor, preprocess, device):
-    tensor = preprocess(img).unsqueeze(0).to(device)
-    with torch.no_grad():
-        out = extractor(tensor).squeeze(-1).squeeze(-1)
-    return out.cpu().numpy()[0]
-
-
-# ── Dynamic Gemini prompt from OHE categories ─────────────────────
-def build_prompt(ohe):
-    cat_map = dict(zip(ohe.feature_names_in_, ohe.categories_))
-    def opts(col):
-        vals = [str(v) for v in cat_map.get(col, [])]
-        return ' or '.join(f'"{v}"' for v in vals) if vals else '"unknown"'
-    return f"""
-Analyze this kurti/dress product image and extract attributes.
-Return ONLY a valid JSON object with EXACTLY these keys and ONLY these allowed values:
-{{
-  "length"         : {opts('length')},
-  "sleeves"        : {opts('sleeves')},
-  "neck"           : {opts('neck')},
-  "work"           : {opts('work')},
-  "pattern"        : {opts('pattern')},
-  "occasion"       : {opts('occasion')},
-  "dupatta"        : true or false,
-  "pants_included" : true or false,
-  "primary_color"  : main color as simple lowercase name (e.g. "teal", "red", "olive_green"),
-  "secondary_color": second color or null,
-  "fabric"         : fabric type
-}}
-CRITICAL: Use ONLY the exact string values listed. Return ONLY the JSON. No markdown. No backticks.
-"""
-
-
-# ── Safe OHE transform ────────────────────────────────────────────
 def safe_ohe_transform(ohe, cat_row):
-    warnings_list = []
-    safe_row      = {}
-    for col, known_cats in zip(ohe.feature_names_in_, ohe.categories_):
-        raw   = str(cat_row.get(col, '')).lower().strip()
-        known = [str(c).lower() for c in known_cats]
-        if raw in known:
-            safe_row[col] = raw
+    warnings = []
+    safe_row = {}
+    for col, known in zip(ohe.feature_names_in_, ohe.categories_):
+        val       = str(cat_row.get(col, "unknown")).lower()
+        known_list = [str(k).lower() for k in known]
+        if val in known_list:
+            safe_row[col] = val
         else:
-            matched = next((k for k in known if raw in k or k in raw), None)
-            if matched:
-                safe_row[col] = matched
-                warnings_list.append(f"[{col}] '{raw}' → '{matched}'")
-            else:
-                fallback = str(known_cats[0])
-                safe_row[col] = fallback
-                warnings_list.append(f"[{col}] '{raw}' unknown → fallback '{fallback}'")
+            safe_row[col] = known_list[0]
+            warnings.append(f"<b>{col}</b>: '{val}' → '{known_list[0]}'")
     encoded = ohe.transform(pd.DataFrame([safe_row]))
-    return encoded, warnings_list
+    return encoded, warnings
 
 
-# ── Feature vector builder ────────────────────────────────────────
-def build_feature_vector(llm_tags, color_feats, resnet_feats, config, ohe, pca):
-    cat_cols        = config.get('cat_cols', [])
-    bool_cols       = config.get('bool_cols', [])
-    num_interp_cols = config.get('num_interp_cols', [])
+def build_features(llm_tags, color_feats, resnet_feats, config, ohe, scaler):
+    cat_cols  = config["cat_cols"]
+    bool_cols = config["bool_cols"]
+    num_cols  = config["num_cols"]
 
-    cat_row              = {col: str(llm_tags.get(col,'')).lower().strip()
-                            for col in cat_cols}
-    cat_encoded, warnings = safe_ohe_transform(ohe, cat_row)
+    X_cat, warnings = safe_ohe_transform(ohe, llm_tags)
 
-    bool_vals = [1 if llm_tags.get(col, False) else 0 for col in bool_cols]
+    X_bool = np.array([
+        1 if llm_tags.get(col, False) else 0
+        for col in bool_cols
+    ]).reshape(1, -1)
 
     num_vals = []
-    for col in num_interp_cols:
-        if col in ('rate_avg','num_orders','days_on_market','sales_velocity'):
-            num_vals.append(float(config.get(f'{col}_mean', 1.0)))
+    for col in num_cols:
+        if col == "rate_avg":
+            num_vals.append(3.5)
+        elif col == "days_on_market":
+            num_vals.append(30)
         else:
-            num_vals.append(float(color_feats.get(col, 0.0)))
+            num_vals.append(float(color_feats.get(col, 0)))
 
-    resnet_pca = pca.transform(resnet_feats.reshape(1, -1))
-
-    X = np.hstack([
-        cat_encoded,
-        np.array(bool_vals).reshape(1,-1),
-        np.array(num_vals).reshape(1,-1),
-        resnet_pca
-    ])
+    X_num    = scaler.transform(np.array(num_vals).reshape(1, -1))
+    X_resnet = resnet_feats.reshape(1, -1)
+    X        = np.hstack([X_cat, X_bool, X_num, X_resnet])
     return X, warnings
 
 
-# ── Similar product finder ────────────────────────────────────────
-def find_similar(llm_tags, train_df, n=5):
-    score_cols = ['work','pattern','occasion','length','primary_color']
-    available  = [c for c in score_cols if c in train_df.columns]
-    if not available:
-        return train_df.head(n)
-    scores = [
-        sum(str(row.get(c,'')).lower() == str(llm_tags.get(c,'')).lower()
-            for c in available)
-        for _, row in train_df.iterrows()
-    ]
-    df         = train_df.copy()
-    df['_sim'] = scores
-    return df.nlargest(n, '_sim').drop(columns='_sim')
+def similarity_prediction_resnet(query_feat, train_feats, train_df, top_k=5):
+    sims       = cosine_similarity(query_feat.reshape(1, -1), train_feats)[0]
+    top_idx    = np.argsort(sims)[-top_k:][::-1]
+    similar_df = train_df.iloc[top_idx].copy()
+    similar_df["similarity_score"] = sims[top_idx]
+    sim_pred   = similar_df["qty_total"].mean()
+    return sim_pred, similar_df
 
 
-# ── Sidebar ───────────────────────────────────────────────────────
-def render_sidebar():
-    _init_key_state()
-    with st.sidebar:
-        st.title("⚙️ Settings")
-
-        # ── Provider status ───────────────────────────────────────
-        st.markdown("**🔑 API Provider Status**")
-
-        g_count  = len(GEMINI_KEYS)
-        or_count = len(OPENROUTER_KEYS)
-
-        st.markdown(f"**Gemini keys loaded:** {'✅ ' + str(g_count) if g_count else '❌ None'}")
-        st.markdown(f"**OpenRouter keys loaded:** {'✅ ' + str(or_count) if or_count else '❌ None'}")
-        st.markdown(f"**Active provider:** `{st.session_state.provider}`")
-        st.markdown(f"**Preferred:** `{PREFERRED_PROVIDER}`")
-
-        # Manual override
-        override = st.selectbox("Override provider", ["auto","gemini","openrouter"])
-        if override != "auto":
-            st.session_state.provider = override
-
-        # ── Model info ────────────────────────────────────────────
-        st.markdown("---")
-        st.markdown("**📊 Model Info**")
-        try:
-            _, _, _, config, train_df = load_model_artifacts()
-            st.metric("Training Samples", config.get('n_training_samples', len(train_df)))
-            st.metric("CV MAE",    f"±{config.get('cv_mae', 8.3):.1f} units")
-            st.metric("CV R²",     f"{config.get('cv_r2', 0):.3f}")
-            st.metric("Best Model", config.get('best_model', 'XGBoost'))
-            st.success("✅ Model loaded")
-        except Exception as e:
-            st.error(f"❌ {e}")
-
-        # ── API call log ──────────────────────────────────────────
-        if st.session_state.api_log:
-            st.markdown("---")
-            st.markdown("**📋 API Log**")
-            for entry in st.session_state.api_log[-8:]:
-                st.caption(entry)
-            if st.button("Clear log"):
-                st.session_state.api_log = []
-
-        st.markdown("---")
-        st.caption("Maalde Demand Prediction Engine v3.0")
+def extract_tags():
+    return {
+        "fabric":        "cotton",
+        "length":        "knee_length",
+        "sleeves":       "three_quarter",
+        "neck":          "round",
+        "work":          "printed",
+        "pattern":       "floral",
+        "primary_color": "blue",
+        "occasion":      "casual",
+        "price_tier":    "mid",
+        "dupatta":       False,
+        "pants_included": True,
+    }
 
 
-# ── Tab 1: Predict ────────────────────────────────────────────────
-def render_predict_tab():
-    col1, col2 = st.columns([1, 1])
+# ─────────────────────────────────────────
+# SIMILAR PRODUCT CARD (Streamlit native)
+# Renders each card using st.columns so base64
+# images are never concatenated into one huge HTML blob.
+# ─────────────────────────────────────────
+def render_sim_cards_grid(similar_df: pd.DataFrame, cols_per_row: int = 5):
+    """Render all similar product cards using Streamlit native columns."""
+    rows = [similar_df.iloc[i:i+cols_per_row] for i in range(0, len(similar_df), cols_per_row)]
 
-    with col1:
-        st.subheader("Upload Design Image")
-        uploaded = st.file_uploader(
-            "Choose a kurti image",
-            type=['jpg','jpeg','png','webp'],
-            label_visibility="collapsed"
-        )
-        if not uploaded:
-            st.info("👆 Upload a kurti image to get started")
+    for row_df in rows:
+        cols = st.columns(len(row_df))
+        for col, (_, row) in zip(cols, row_df.iterrows()):
+            code  = str(row.get("product_code", "")).strip()
+            name  = str(row.get("product_name", "Product"))
+            price = row.get("rate_avg", None)
+            color = str(row.get("primary_color", "")).title()
+            work  = str(row.get("work", "")).title()
+            patt  = str(row.get("pattern", "")).title()
+            score = float(row.get("similarity_score", 0))
 
-            # Show key config status
-            if not GEMINI_KEYS and not OPENROUTER_KEYS:
-                st.error("❌ No API keys configured. Add keys to your .env file.")
-            return
+            with col:
+                # ── Image ──────────────────────────────────────────────────
+                img_b64 = get_product_image_b64(code)
+                if img_b64:
+                    st.markdown(
+                        f'''<div style="border-radius:10px;overflow:hidden;aspect-ratio:3/4;background:#1a1a22;">
+                            <img src="{img_b64}" style="width:100%;height:100%;object-fit:cover;display:block;" />
+                        </div>''',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.markdown(
+                        '''<div style="border-radius:10px;background:#1a1a22;aspect-ratio:3/4;
+                            display:flex;align-items:center;justify-content:center;font-size:2.5rem;opacity:0.4;">
+                            👗
+                        </div>''',
+                        unsafe_allow_html=True
+                    )
 
-        img = Image.open(uploaded).convert('RGB')
-        st.image(img, caption="Uploaded Design", use_column_width=True)
-
-        # Show which provider will be used
-        provider_label = st.session_state.provider
-        if provider_label == "gemini" and GEMINI_KEYS:
-            st.info(f"🔑 Using Gemini ({len(GEMINI_KEYS)} keys) → OpenRouter fallback")
-        elif provider_label == "openrouter" and OPENROUTER_KEYS:
-            st.info(f"🔑 Using OpenRouter ({len(OPENROUTER_KEYS)} keys) → Gemini fallback")
-        else:
-            st.warning("⚠️ No API keys in .env — prediction uses visual features only")
-
-        predict_btn = st.button("🔮 Predict Demand", type="primary",
-                                use_container_width=True)
-
-    if not predict_btn or not uploaded:
-        return
-
-    # ── Load model ────────────────────────────────────────────────
-    try:
-        model, ohe, pca, config, train_df = load_model_artifacts()
-    except Exception as e:
-        st.error(f"❌ Model not found: {e}\n\nRun the training notebook first.")
-        return
-
-    # ── Extract visual features ───────────────────────────────────
-    with st.spinner("Extracting visual features..."):
-        try:
-            extractor, preprocess, device = load_resnet()
-            color_feats  = get_color_features(img)
-            resnet_feats = extract_resnet_features(img, extractor, preprocess, device)
-        except Exception as e:
-            st.error(f"❌ Feature extraction failed: {e}")
-            return
-
-    # ── LLM tags via auto-rotating provider ──────────────────────
-    llm_tags = {}
-    has_keys = bool(GEMINI_KEYS or OPENROUTER_KEYS)
-
-    if has_keys:
-        with st.spinner(f"Analyzing design with AI ({st.session_state.provider})..."):
-            prompt = build_prompt(ohe)
-            raw    = call_vision_api(prompt, img)
-            if raw:
-                try:
-                    cleaned  = raw.replace('```json','').replace('```','').strip()
-                    llm_tags = json.loads(cleaned)
-                except json.JSONDecodeError:
-                    st.warning("⚠️ Could not parse AI response — using visual features only")
-            else:
-                st.warning("⚠️ All API keys exhausted — using visual features only")
-    else:
-        st.warning("⚠️ No API keys in .env file — prediction based on visual features only")
-
-    # ── Predict ───────────────────────────────────────────────────
-    with st.spinner("Predicting demand..."):
-        try:
-            X, ohe_warnings = build_feature_vector(
-                llm_tags, color_feats, resnet_feats, config, ohe, pca
-            )
-            log_pred = float(model.predict(X)[0])
-            pred_qty = max(1, round(np.expm1(log_pred)))
-        except Exception as e:
-            st.error(f"❌ Prediction failed: {e}")
-            import traceback
-            st.code(traceback.format_exc())
-            return
-
-    if ohe_warnings:
-        with st.expander("⚠️ Attribute remapping warnings"):
-            for w in ohe_warnings:
-                st.write(f"• {w}")
-
-    st.session_state.update({
-        'prediction'  : pred_qty,
-        'llm_tags'    : llm_tags,
-        'color_feats' : color_feats,
-        'train_df'    : train_df,
-        'config'      : config,
-        'log_pred'    : log_pred,
-        'ohe'         : ohe,
-        'ohe_warnings': ohe_warnings,
-    })
-
-    with col2:
-        _render_results(pred_qty, log_pred, llm_tags, color_feats,
-                        train_df, config, ohe, ohe_warnings)
+                # ── Info ───────────────────────────────────────────────────
+                st.markdown(
+                    f'''<div style="padding:0.5rem 0.2rem;">
+                        <div style="font-size:0.78rem;font-weight:500;color:#e8e4dc;
+                            white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+                            title="{name}">{name[:28]}{"…" if len(name)>28 else ""}</div>
+                        <div style="font-size:0.65rem;color:#7a7880;letter-spacing:0.06em;margin-top:2px;">{code}</div>
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;">
+                            <span style="font-family:'Cormorant Garamond',serif;font-size:1.1rem;color:#e8b86d;">
+                                {"₹{:,.0f}".format(price) if price else "—"}
+                            </span>
+                            <span style="font-size:0.62rem;background:rgba(232,184,109,0.1);
+                                border:1px solid rgba(232,184,109,0.25);color:#e8b86d;
+                                border-radius:100px;padding:2px 7px;">{score:.2f}</span>
+                        </div>
+                        <div style="margin-top:5px;display:flex;flex-wrap:wrap;gap:3px;">
+                            {" ".join([
+                                f'<span style="font-size:0.6rem;background:#1a1a22;border-radius:4px;padding:2px 6px;color:#7a7880;">{t}</span>'
+                                for t in [color, work, patt] if t and t.lower() not in ("", "nan", "None")
+                            ])}
+                        </div>
+                    </div>''',
+                    unsafe_allow_html=True
+                )
+                st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
 
 
-# ── Results panel ─────────────────────────────────────────────────
-def _render_results(pred_qty, log_pred, llm_tags, color_feats,
-                    train_df, config, ohe, ohe_warnings):
-    y_mean = config.get('y_mean', pred_qty)
-    y_max  = config.get('y_max', max(pred_qty * 2, 1))
+# ─────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────
+def main():
+    st.markdown(PREMIUM_CSS, unsafe_allow_html=True)
 
-    st.subheader("📦 Prediction Result")
-
-    if pred_qty >= y_mean * 1.5:
-        level, color, emoji = "HIGH DEMAND",     "#28a745", "🔥"
-    elif pred_qty >= y_mean * 0.7:
-        level, color, emoji = "MODERATE DEMAND", "#ffc107", "📈"
-    else:
-        level, color, emoji = "LOW DEMAND",      "#dc3545", "📉"
-
-    st.markdown(f"""
-    <div style='background:{color}22; border-left:4px solid {color};
-                padding:20px; border-radius:8px; margin-bottom:16px'>
-        <h1 style='color:{color}; margin:0'>{emoji} {pred_qty} Units</h1>
-        <p style='color:{color}; margin:4px 0 0 0; font-weight:bold'>{level}</p>
-        <p style='color:gray; margin:4px 0 0 0'>Predicted total quantity sold</p>
+    # ── Hero Header ──────────────────────────────────────────────────────────
+    st.markdown("""
+    <div>
+        <p class="hero-sub">Fashion Intelligence · AI-Powered</p>
+        <h1 class="hero-title">Demand <span>Oracle</span></h1>
+        <div class="hero-line"></div>
     </div>
     """, unsafe_allow_html=True)
 
-    pct = min(pred_qty / max(y_max, 1), 1.0)
-    st.markdown("**Demand Strength**")
-    st.progress(pct)
-    st.caption(f"Avg: {y_mean:.0f} | Max: {y_max:.0f} | log_pred: {log_pred:.3f}")
+    # ── Load models ──────────────────────────────────────────────────────────
+    model, ohe, scaler, config, train_df, resnet_train = load_artifacts()
+    extractor, preprocess, device = load_resnet()
 
-    # LLM tags
-    if llm_tags:
-        st.subheader("🏷️ Detected Attributes")
-        cat_map = dict(zip(ohe.feature_names_in_, ohe.categories_))
-        tag_display = {
-            '📏 Length'  : ('length',   llm_tags.get('length','—')),
-            '👕 Sleeves' : ('sleeves',  llm_tags.get('sleeves','—')),
-            '👔 Neck'    : ('neck',     llm_tags.get('neck','—')),
-            '✨ Work'    : ('work',     llm_tags.get('work','—')),
-            '🌸 Pattern' : ('pattern',  llm_tags.get('pattern','—')),
-            '🎉 Occasion': ('occasion', llm_tags.get('occasion','—')),
-            '🎨 Color'   : (None,       llm_tags.get('primary_color','—')),
-            '🧵 Fabric'  : (None,       llm_tags.get('fabric','—')),
-            '🧣 Dupatta' : (None,       '✅' if llm_tags.get('dupatta') else '❌'),
-            '👖 Pants'   : (None,       '✅' if llm_tags.get('pants_included') else '❌'),
-        }
-        cols = st.columns(2)
-        for i, (label, (ohe_col, val)) in enumerate(tag_display.items()):
-            display_val = str(val).replace('_',' ').title()
-            if ohe_col and ohe_col in cat_map:
-                known = [str(c).lower() for c in cat_map[ohe_col]]
-                display_val += " ✅" if str(val).lower() in known else " ⚠️"
-            cols[i%2].metric(label, display_val)
-    else:
-        st.info("Prediction based on visual features only (no AI tags)")
+    # ── Build Drive image map ─────────────────────────────────────────────────
+    global PRODUCT_IMAGE_MAP
+    if not PRODUCT_IMAGE_MAP:
+        with st.spinner("🔗 Connecting to Drive image library…"):
+            PRODUCT_IMAGE_MAP = build_image_map_from_drive(DRIVE_FOLDER_ID, GOOGLE_API_KEY)
 
-    # Visual analysis
-    with st.expander("🎨 Visual Feature Analysis"):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Brightness",   f"{color_feats.get('brightness_mean',0):.2f}")
-        c2.metric("Colorfulness", f"{color_feats.get('colorfulness',0):.2f}")
-        c3.metric("Edge Density", f"{color_feats.get('edge_density',0):.2f}")
-        c4.metric("Texture",      f"{color_feats.get('texture_complexity',0):.2f}")
+    # Show Drive connection status in sidebar
+    with st.sidebar:
+        st.markdown("### 🗂 Drive Images")
+        if PRODUCT_IMAGE_MAP:
+            st.success(f"✅ {len(PRODUCT_IMAGE_MAP)} images linked")
+            st.caption(f"Folder: `{DRIVE_FOLDER_ID[:20]}…`")
+        elif GOOGLE_API_KEY:
+            st.error("❌ Could not load images")
+        else:
+            st.warning("⚠️ Add API key to enable Drive images")
+            st.caption("Set `GOOGLE_API_KEY` in app.py")
+            st.markdown("""
+**How to get a free key:**
+1. Go to [console.cloud.google.com](https://console.cloud.google.com)
+2. Enable **Google Drive API**
+3. Create → **API Key**
+4. Paste into `GOOGLE_API_KEY`
+""")
 
-    # OHE debug
-    with st.expander("🔍 Debug — OHE Validation"):
-        cat_map = dict(zip(ohe.feature_names_in_, ohe.categories_))
-        rows = []
-        for col, known_cats in cat_map.items():
-            gemini_val = str(llm_tags.get(col, 'NOT PROVIDED')).lower()
-            known      = [str(c).lower() for c in known_cats]
-            matched    = gemini_val in known
-            rows.append({
-                "Feature"      : col,
-                "AI Value"     : gemini_val,
-                "Status"       : "✅ Known" if matched else "❌ Fallback used",
-                "Known Values" : ", ".join(known),
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    # ── Two-column layout ─────────────────────────────────────────────────────
+    left, right = st.columns([1, 1.8], gap="large")
 
-    # Similar designs
-    st.subheader("🔍 Similar Past Designs")
-    if llm_tags:
-        similar   = find_similar(llm_tags, train_df, n=5)
-        show_cols = [c for c in ['product_code','product_name','qty_total',
-                                  'rate_avg','work','pattern','occasion',
-                                  'primary_color'] if c in similar.columns]
-        if 'qty_total' in similar.columns:
-            similar = similar.sort_values('qty_total', ascending=False)
-        out        = similar[show_cols].reset_index(drop=True)
-        out.index += 1
-        st.dataframe(out, use_container_width=True)
-        if 'qty_total' in similar.columns:
-            st.caption(f"Similar avg qty: {similar['qty_total'].mean():.0f} | Prediction: {pred_qty}")
-    else:
-        st.info("Add API keys to .env for similar design matching")
+    with left:
+        st.markdown('<div class="section-head">Upload Product Image</div>', unsafe_allow_html=True)
+        uploaded = st.file_uploader("", type=["jpg","png","jpeg","webp"], label_visibility="collapsed")
 
+        if uploaded:
+            img = Image.open(uploaded).convert("RGB")
+            # Render image in styled card
+            import base64, io
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            st.markdown(f"""
+            <div class="img-card">
+                <img src="data:image/png;base64,{b64}" />
+                <div class="img-card-label">📷 {uploaded.name}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-# ── Tab 2: Analytics ──────────────────────────────────────────────
-def render_analytics_tab():
-    st.subheader("📊 Sales Pattern Analysis")
-    try:
-        _, _, _, config, train_df = load_model_artifacts()
-    except Exception as e:
-        st.error(f"❌ {e}")
-        return
+            st.markdown("<br>", unsafe_allow_html=True)
+            predict_btn = st.button("✦  Run Demand Prediction")
 
-    if 'qty_total' not in train_df.columns:
-        st.warning("No qty_total in training data.")
-        return
+        else:
+            predict_btn = False
+            st.markdown("""
+            <div style="text-align:center; padding: 3rem 1rem; color: var(--muted); font-size:0.8rem; letter-spacing:0.1em; text-transform:uppercase;">
+                Drop a product image to begin
+            </div>
+            """, unsafe_allow_html=True)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Products", len(train_df))
-    c2.metric("Avg Qty Sold",   f"{train_df['qty_total'].mean():.0f}")
-    c3.metric("Top Seller",     f"{train_df['qty_total'].max():.0f} units")
-    c4.metric("Median Qty",     f"{train_df['qty_total'].median():.0f}")
-    st.markdown("---")
+    with right:
+        if uploaded and predict_btn:
+            with st.spinner("Analysing image & computing demand…"):
 
-    cat_cols_avail = [c for c in ['work','pattern','occasion','length',
-                                   'sleeves','primary_color']
-                      if c in train_df.columns]
-    if cat_cols_avail:
-        selected = st.selectbox("Analyze by attribute:", cat_cols_avail)
-        grp = (train_df.groupby(selected)['qty_total']
-                       .agg(['mean','count'])
-                       .rename(columns={'mean':'Avg Qty','count':'Products'})
-                       .sort_values('Avg Qty', ascending=False))
+                # ── Feature extraction ──────────────────────────────────────
+                color_feats  = get_color_features(img)
+                resnet_feats = extract_resnet_features(img, extractor, preprocess, device)
+                llm_tags     = extract_tags()
 
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-        grp['Avg Qty'].plot(kind='bar', ax=axes[0], color='steelblue', edgecolor='white')
-        axes[0].set_title(f'Avg Qty Sold by {selected.title()}')
-        axes[0].set_ylabel('Avg Units Sold')
-        axes[0].tick_params(axis='x', rotation=45)
-        grp['Products'].plot(kind='bar', ax=axes[1], color='coral', edgecolor='white')
-        axes[1].set_title(f'Number of Products by {selected.title()}')
-        axes[1].set_ylabel('Count')
-        axes[1].tick_params(axis='x', rotation=45)
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-        st.dataframe(grp.reset_index(), use_container_width=True)
+                X, warnings = build_features(
+                    llm_tags, color_feats, resnet_feats, config, ohe, scaler
+                )
 
-    st.markdown("---")
-    st.subheader("Qty Distribution")
-    fig, ax = plt.subplots(figsize=(10, 3))
-    train_df['qty_total'].plot(kind='hist', bins=30, ax=ax,
-                               color='gold', edgecolor='black')
-    ax.set_xlabel('Total Qty Sold')
-    ax.set_title('Distribution of Sales Across Products')
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close()
+                model_pred = np.expm1(model.predict(X)[0])
+                sim_pred, similar_df = similarity_prediction_resnet(
+                    resnet_feats, resnet_train, train_df
+                )
+                final_pred = 0.5 * model_pred + 0.5 * sim_pred
+                # Store in session state so similar products section can access it
+                st.session_state["similar_df"] = similar_df
 
-    st.markdown("---")
-    st.subheader("🏆 All Products — Sorted by Sales")
-    show_cols = [c for c in ['product_code','product_name','qty_total',
-                              'rate_avg','work','pattern','occasion',
-                              'primary_color'] if c in train_df.columns]
-    top        = (train_df[show_cols]
-                  .sort_values('qty_total', ascending=False)
-                  .reset_index(drop=True))
-    top.index += 1
-    st.dataframe(top, use_container_width=True)
+            # ── Metrics ────────────────────────────────────────────────────
+            st.markdown('<div class="section-head">Prediction Results</div>', unsafe_allow_html=True)
+            st.markdown(f"""
+            <div class="metric-row">
+                <div class="metric-card">
+                    <div class="metric-label">ML Model</div>
+                    <div class="metric-value">{round(model_pred)}</div>
+                    <div class="metric-unit">units predicted</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Similarity</div>
+                    <div class="metric-value">{round(sim_pred)}</div>
+                    <div class="metric-unit">units (neighbours)</div>
+                </div>
+                <div class="metric-card highlight">
+                    <div class="metric-label">Final Forecast</div>
+                    <div class="metric-value">{round(final_pred)}</div>
+                    <div class="metric-unit">units · 50/50 blend</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
+            # ── Detected tags ───────────────────────────────────────────────
+            st.markdown('<div class="section-head">Detected Attributes</div>', unsafe_allow_html=True)
+            chips = "".join([
+                f'<span class="tag-chip {"warm" if v and v is not False else ""}">'
+                f'{k.replace("_"," ").title()}: {v}</span>'
+                for k, v in llm_tags.items()
+            ])
+            st.markdown(f'<div style="margin-bottom:1rem">{chips}</div>', unsafe_allow_html=True)
 
-# ── Tab 3: How It Works ───────────────────────────────────────────
-def render_how_it_works_tab():
-    st.subheader("ℹ️ How the Prediction System Works")
+            # ── Image analytics ─────────────────────────────────────────────
+            cf = color_feats
+            st.markdown('<div class="section-head">Visual Analytics</div>', unsafe_allow_html=True)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Brightness", f"{cf['brightness_mean_y']:.2f}")
+            c2.metric("Colorfulness", f"{cf['colorfulness_y']:.2f}")
+            c3.metric("Edge Density", f"{cf['edge_density_y']:.2f}")
 
-    g_status  = f"✅ {len(GEMINI_KEYS)} keys"  if GEMINI_KEYS  else "❌ Not configured"
-    or_status = f"✅ {len(OPENROUTER_KEYS)} keys" if OPENROUTER_KEYS else "❌ Not configured"
+            # ── Warnings ────────────────────────────────────────────────────
+            if warnings:
+                warn_items = "".join([f'<div class="warn-item">→ {w}</div>' for w in warnings])
+                st.markdown(f"""
+                <div class="warn-box">
+                    <div class="warn-box-title">⚠ Encoding Adjustments</div>
+                    {warn_items}
+                </div>
+                """, unsafe_allow_html=True)
 
-    st.markdown(f"""
-    ### 🔑 API Key Configuration
-    | Provider | Status | Keys File |
-    |----------|--------|-----------|
-    | Gemini   | {g_status} | `.env` → `GEMINI_KEY_1`, `GEMINI_KEY_2`... |
-    | OpenRouter | {or_status} | `.env` → `OPENROUTER_KEY_1`, `OPENROUTER_KEY_2`... |
+        elif not uploaded:
+            st.markdown("""
+            <div style="display:flex; align-items:center; justify-content:center; height:300px; color:var(--muted); font-size:0.8rem; letter-spacing:0.1em; text-transform:uppercase;">
+                Results will appear here
+            </div>
+            """, unsafe_allow_html=True)
 
-    Keys rotate automatically when quota is exhausted.
-    Provider switches automatically if all keys of current provider fail.
+    # ── Similar Products (full width) ─────────────────────────────────────────
+    if uploaded and predict_btn and st.session_state.get("similar_df") is not None:
+        similar_df = st.session_state["similar_df"]
+        st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-head">Similar Products · Visual Neighbours</div>', unsafe_allow_html=True)
 
-    ### 🧠 Prediction Pipeline
-    1. **ResNet50** → 2048 deep visual features → PCA → 50 features
-    2. **Gemini/OpenRouter Vision** → length, sleeves, neck, work, pattern, color, occasion
-    3. **Color/texture stats** → brightness, colorfulness, edge density etc.
-    4. **XGBoost** trained on log1p(qty_total) → expm1 to get final prediction
+        # Render cards using native Streamlit columns (avoids base64 blob truncation)
+        render_sim_cards_grid(similar_df, cols_per_row=5)
 
-    ### 📊 Model Performance
-    - **CV R²:** 0.660 | **CV MAE:** 8.3 units
-    - **Features:** 154 total (OHE + color + PCA ResNet)
-    - **Training samples:** 145 matched products
-
-    ### ⚠️ Limitations
-    - Small dataset → ±30% prediction uncertainty
-    - No seasonal signals (April 2026 data only)
-    - Cold start for truly novel designs
-
-    ### 🚀 Future Improvements
-    - More training data → better accuracy
-    - Festival/season calendar features
-    - Fine-tuned fashion vision model
-    """)
-
-
-# ── Main ──────────────────────────────────────────────────────────
-def main():
-    render_sidebar()
-    st.title("👗 Maalde — Demand Prediction Engine")
-    st.markdown("Upload a kurti design image to predict how many units it will sell.")
-
-    tab1, tab2, tab3 = st.tabs(["🔮 Predict", "📊 Analytics", "ℹ️ How It Works"])
-    with tab1: render_predict_tab()
-    with tab2: render_analytics_tab()
-    with tab3: render_how_it_works_tab()
+        # Expandable raw data
+        with st.expander("View raw data table"):
+            disp_cols = [c for c in [
+                "product_code","product_name","rate_avg","qty_total",
+                "primary_color","work","pattern","similarity_score"
+            ] if c in similar_df.columns]
+            st.dataframe(similar_df[disp_cols], use_container_width=True)
 
 
 if __name__ == "__main__":
